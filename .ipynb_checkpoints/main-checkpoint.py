@@ -1,11 +1,41 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import APIKeyHeader
 from sqlalchemy import create_engine, text
 import os
 
+# Rate limiting
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+
+# Caching
+import redis
+import json
+
 app = FastAPI(title="India Geo API", version="1.0")
 
 engine = create_engine("postgresql://neondb_owner:npg_7sv0JmSfOikH@ep-shy-truth-an1aj3mt-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+# ================================
+# ⚡ REDIS (CACHE)
+# ================================
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    redis_client = redis.from_url(REDIS_URL)
+else:
+    redis_client = None
+
+# ================================
+# ⚡ REDIS (SAFE INIT)
+# ================================
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    redis_client = redis.from_url(REDIS_URL)
+else:
+    redis_client = None  # fallback for local
+
 # ================================
 # 🔑 API KEY SECURITY
 # ================================
@@ -14,7 +44,7 @@ api_key_header = APIKeyHeader(name="x-api-key")
 def verify_api_key(api_key: str = Depends(api_key_header)):
     with engine.connect() as conn:
         result = conn.execute(
-            text("SELECT * FROM api_keys WHERE key = :key"),
+            text("SELECT 1 FROM api_keys WHERE key = :key"),
             {"key": api_key}
         ).fetchone()
 
@@ -22,16 +52,37 @@ def verify_api_key(api_key: str = Depends(api_key_header)):
             raise HTTPException(status_code=403, detail="Invalid API key")
 
 # ================================
-# 🔍 AUTOCOMPLETE API
+# 🚦 RATE LIMITING
+# ================================
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+def rate_limit_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded"}
+    )
+
+# ================================
+# 🔍 AUTOCOMPLETE
 # ================================
 @app.get("/autocomplete")
+@limiter.limit("100/minute")
 def autocomplete(
+    request: Request,
     q: str,
     state: str = None,
     district: str = None,
-    api_key: str = Depends(api_key_header)
+    api_key: str = Depends(verify_api_key)
 ):
-    verify_api_key(api_key)
+    cache_key = f"search:{q}:{state}:{district}"
+
+    # 🔹 CACHE CHECK
+    if redis_client:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
 
     base_query = """
         SELECT 
@@ -72,60 +123,70 @@ def autocomplete(
             for row in result
         ]
 
+    # 🔹 SAVE CACHE
+    if redis_client:
+        redis_client.setex(cache_key, 3600, json.dumps(data))
+
     return data
 
-
 # ================================
-# 🌍 GET STATES
+# 🌍 STATES
 # ================================
 @app.get("/states")
-def get_states(api_key: str = Depends(api_key_header)):
-    verify_api_key(api_key)
-
+@limiter.limit("50/minute")
+def get_states(
+    request: Request,
+    api_key: str = Depends(verify_api_key)
+):
     with engine.connect() as conn:
         result = conn.execute(
             text("SELECT id, name FROM states ORDER BY name")
         )
         return [dict(row._mapping) for row in result]
 
-
 # ================================
-# 🏙 GET DISTRICTS
+# 🏙 DISTRICTS
 # ================================
 @app.get("/districts")
-def get_districts(state_id: int, api_key: str = Depends(api_key_header)):
-    verify_api_key(api_key)
-
-    query = text("""
-        SELECT id, name 
-        FROM districts 
-        WHERE state_id = :id
-        ORDER BY name
-    """)
-
+@limiter.limit("50/minute")
+def get_districts(
+    request: Request,
+    state_id: int,
+    api_key: str = Depends(verify_api_key)
+):
     with engine.connect() as conn:
-        result = conn.execute(query, {"id": state_id})
+        result = conn.execute(
+            text("""
+                SELECT id, name 
+                FROM districts 
+                WHERE state_id = :id
+                ORDER BY name
+            """),
+            {"id": state_id}
+        )
         return [dict(row._mapping) for row in result]
 
-
 # ================================
-# 🏘 GET SUBDISTRICTS
+# 🏘 SUBDISTRICTS
 # ================================
 @app.get("/subdistricts")
-def get_subdistricts(district_id: int, api_key: str = Depends(api_key_header)):
-    verify_api_key(api_key)
-
-    query = text("""
-        SELECT id, name 
-        FROM sub_districts 
-        WHERE district_id = :id
-        ORDER BY name
-    """)
-
+@limiter.limit("50/minute")
+def get_subdistricts(
+    request: Request,
+    district_id: int,
+    api_key: str = Depends(verify_api_key)
+):
     with engine.connect() as conn:
-        result = conn.execute(query, {"id": district_id})
+        result = conn.execute(
+            text("""
+                SELECT id, name 
+                FROM sub_districts 
+                WHERE district_id = :id
+                ORDER BY name
+            """),
+            {"id": district_id}
+        )
         return [dict(row._mapping) for row in result]
-
 
 # ================================
 # ❤️ HEALTH CHECK
